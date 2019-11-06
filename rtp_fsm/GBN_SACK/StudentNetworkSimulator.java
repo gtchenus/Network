@@ -168,15 +168,18 @@ public class StudentNetworkSimulator extends NetworkSimulator {
             ++this.numCorrupt;
             return;
         }
+        // check whether the ACK is the expecting cumulative ACK
         boolean isExpectSeq = snder.hasSeqnum(packet);
+        // check whether packet has any qualified ACKs(Belongs to send window)
+        // If has, try signaling and updating it on BitMap
         Set<Integer> indexes= snder.updateBitMap(packet);
-        if (indexes.size() >0) {
-            // has some updated Bitmap
+        if (indexes.size() > 0) {
+            // has some Bitmap updates
             snder.rtt.addRcvdCOMM(rcvdTime, indexes);
-        } else ;// bitMap already updated
+        } else ;// bitMap already update to date
 
         if (isExpectSeq) {
-            // received a qualified packet
+            // received a qualified ACK
             // stop and start timer
             System.out.println("Sender: PACKET QUALIFIED >> PASS TOLAYER5 AND SLIDE SEND WINDOW");
             snder.rtt.addRcvdRTT(rcvdTime, packet.getAcknum());
@@ -306,6 +309,7 @@ public class StudentNetworkSimulator extends NetworkSimulator {
         System.out.println("RTT valid count = " + snder.rtt.getRttCount());
         System.out.println("Cumulative communication time = " + snder.rtt.getCumulativeCOMM());
         System.out.println("Communication valid count = " + snder.rtt.getCommCount());
+        System.out.println("Number of qualified ACKs and SACKs (BitMap flips count) = " + snder.numBitMapUpdates());
         //System.out.println("Example statistic you want to check e.g. number of ACK packets received by A :" + "<YourVariableHere>");
     }
 

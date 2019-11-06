@@ -16,11 +16,12 @@ import java.util.*;
 
 public class Sender extends AbstractHost {
 
+    public RTTtimer rtt;        // for computing effective RTT
     private Buffer<Packet> sndBuff;
     private SendWindow sndWindow;
     private boolean[] bitMap;   // only for sender to reduce retransmission
     private int usedSeq;        // seq of the latest packet in buffer
-    public RTTtimer rtt;       // for computing effective RTT
+    private int flipCount;      // number of bits flip count in bitMap
 
 
     public Sender() {
@@ -30,6 +31,7 @@ public class Sender extends AbstractHost {
         this.rtt = new RTTtimer(sndBuff.getCapacity());
         this.sndWindow = new SendWindow(10, sndBuff.getCapacity());
         this.bitMap = new boolean[sndBuff.getCapacity()];
+        this.flipCount = 0;
         this.seqSpace = 2 * this.sndWindow.size();
     }
 
@@ -43,6 +45,7 @@ public class Sender extends AbstractHost {
         this.rtt = new RTTtimer(buffCapacity);
         this.sndWindow = new SendWindow(windowSize, buffCapacity);
         this.bitMap = new boolean[50];
+        this.flipCount = 0;
         this.seqSpace = seqSpace;
     }
 
@@ -72,37 +75,6 @@ public class Sender extends AbstractHost {
         return false;
     }
 
-    /*
-     * Set the bit of ackIndex on bitMap
-     * @return false when the corresponding bit has already been set
-     */
-    private boolean updateBitMap(int ackIndex) {
-        if (!this.sndWindow.contains(ackIndex)) {
-            throw new IllegalArgumentException("Send window does not contain the index to set the bitMap");
-        }
-        return !updateBitMap(ackIndex, ackIndex).isEmpty();
-    }
-
-    /**
-     * Signal cumulative ack on bitMap by setting true from [baseIndex, ackIndex]
-     *
-     * @param baseIndex starting position,
-     *                  = windowBase when received a qualified packet with expecting ack
-     *                  = ackIndex it self when received a qualified sack in the range of window
-     * @param ackIndex  ending position
-     */
-    private List<Integer> updateBitMap(int baseIndex, int ackIndex) {
-        if (baseIndex > ackIndex) {
-            throw new IllegalArgumentException();
-        }
-        List<Integer> updates = new LinkedList<>();
-        for (int i = baseIndex; i <= ackIndex && !bitMap[i]; ++i) {
-            bitMap[i] = true;
-            updates.add(i);
-        }
-        return updates;
-    }
-
     /**
      * Retrieve and check an non-corrupted incoming packet
      * Set bitmap when packet falling into window range
@@ -111,10 +83,10 @@ public class Sender extends AbstractHost {
      *            1. Packet might be corrupted
      *            2. ACK might be out of snwWindow(received before)
      * @return true when Ack(packet) is inside window and Ack(packet) >= Seq(base), indicating
-     *            1. Caller should slide sndWindow
-     *            2. Caller should reset timer
+     * 1. Caller should slide sndWindow
+     * 2. Caller should reset timer
      * @retrun false when
-     *            i. No Acknums in the range, do nothing
+     * i. No Acknums in the range, do nothing
      */
     @Override
     public boolean hasSeqnum(Packet pkt) {
@@ -127,24 +99,63 @@ public class Sender extends AbstractHost {
         return false;
     }
 
+    /*
+     * Set the bit of ackIndex on bitMap
+     * @return false when the corresponding bit has already been set
+     */
+    private boolean setBitMap(int ackIndex) {
+        if (!this.sndWindow.contains(ackIndex)) {
+            throw new IllegalArgumentException("Send window does not contain the index to set the bitMap");
+        }
+        return !setBitMapInternal(ackIndex, ackIndex).isEmpty();
+    }
+
+    public int numBitMapUpdates() {
+        return this.flipCount;
+    }
+
     /**
+     * Signal cumulative ack on bitMap by setting true from [baseIndex, ackIndex]
+     *
+     * @param baseIndex starting position,
+     *                  = windowBase when received a qualified packet with expecting ack
+     *                  = ackIndex it self when received a qualified sack in the range of window
+     * @param ackIndex  ending position
+     *                  return a list of indexes in send window that has successfully been updated(flipped to 1)
+     */
+    private List<Integer> setBitMapInternal(int baseIndex, int ackIndex) {
+        if (baseIndex > ackIndex) {
+            throw new IllegalArgumentException();
+        }
+        List<Integer> updates = new LinkedList<>();
+        for (int i = baseIndex; i <= ackIndex && !bitMap[i]; ++i) {
+            bitMap[i] = true;
+            ++this.flipCount;
+            updates.add(i);
+        }
+        return updates;
+    }
+
+
+    /**
+     * Sender API to update bitMap
      * Return a set of index being updated successfully
      */
     public Set<Integer> updateBitMap(Packet pkt) {
         Set<Integer> updatedSet = new LinkedHashSet<>();
         int ackIndex = getAckIndex(pkt.getAcknum());
         if (ackIndex >= 0) {
-            // cumu ack
+            // cumulative ack
             // qualified packet inside sndWindow
-            List<Integer> updates = updateBitMap(this.sndWindow.getBase(), ackIndex);
+            List<Integer> updates = setBitMapInternal(this.sndWindow.getBase(), ackIndex);
             if (!updates.isEmpty()) updatedSet.addAll(updates);
         }
         int[] sacks = pkt.getSack();
-        for (int i = 0; i < sacks.length; ++i) {
+        for (int i = 0; i < sacks.length && sacks[i] != 0; ++i) {
             ackIndex = getAckIndex(sacks[i]);
             if (ackIndex >= 0) {
                 // has qualified sack inside sndWindow
-                boolean isUpdated = updateBitMap(ackIndex);
+                boolean isUpdated = setBitMap(ackIndex);
                 if (!isUpdated) updatedSet.add(ackIndex);
             }
         }
@@ -319,7 +330,7 @@ public class Sender extends AbstractHost {
             this.cumuRTT = 0;
             this.rttCount = 0;
             this.cumuCOMM = 0;
-            this.commCount= 0;
+            this.commCount = 0;
         }
 
         /**
@@ -337,6 +348,7 @@ public class Sender extends AbstractHost {
 
         /**
          * add a sent time into both both RTT and COMM buffer
+         *
          * @param time sent time of a packet in send window
          */
         public boolean addSent(double time) {
@@ -350,8 +362,9 @@ public class Sender extends AbstractHost {
          * 1. Ack is not a subsequently ending ack(receiver buffer effect)
          * from receiver (should be the same first ack as the window base)
          * 2. Packet is not sent by retransmission
+         *
          * @param time pkt received time at the sender
-         * @param ack pkt ack to identify whether it is in sndWidnow
+         * @param ack  pkt ack to identify whether it is in sndWidnow
          * @return true if received contributes to RTT
          */
         public boolean addRcvdRTT(double time, int ack) {
